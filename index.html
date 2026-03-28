@@ -184,7 +184,8 @@ const T = {
     WATER: 6, LAVA: 7, PIT: 8, HAZARD: 9,
     PROP_TORCH: 10, PROP_BARREL: 11, PROP_CHEST: 12, PROP_SKULL: 13,
     PROP_MUSHROOM: 14, PROP_ANVIL: 15, PROP_CRYSTAL: 16, PROP_PILLAR: 17,
-    PROP_CRATE: 18, PROP_BONES: 19
+    PROP_CRATE: 18, PROP_BONES: 19,
+    LOG_BRIDGE: 38, HEAL_WATER: 39, BOSS_WATER: 40
 };
 
 // --- GAME STATE ---
@@ -1644,6 +1645,10 @@ function updatePlayer(dt) {
             if (pt === T.CURRENT_S && !player.items.includes('aqua_boots')) currentPushY = player.speed * 0.4;
             if (pt === T.CURRENT_E && !player.items.includes('aqua_boots')) currentPushX = player.speed * 0.4;
             if (pt === T.DEEP_WATER) damagePlayer(1, player.x, player.y);
+            if (pt === T.BOSS_WATER) {
+                speedMult = 0.3;
+                if (Math.random() < 0.15) spawnParticle('splash', player.x, player.y + 4, { color: '#1a3a6a', size: 1, life: 0.3 });
+            }
         }
         player.x += (mx * player.speed * speedMult + currentPushX) * dt;
         player.y += (my * player.speed * speedMult + currentPushY) * dt;
@@ -4362,7 +4367,7 @@ function updateBoss(dt) {
             spawnPickup(boss.x, boss.y, 'item', 0);
             pickups[pickups.length-1]._itemId = pick;
             // Floor clear
-            game.floorClear = { timer: 0, shown: false };
+            game.floorClear = { timer: 0, shown: false, floor: 1 };
         }
         return;
     }
@@ -4928,6 +4933,643 @@ function drawSmithSprite(ctx, bx, by, s, time) {
     ctx.fillRect(bx + 3 + sway, (by - 15)*s|0, 2*s, 3*s);
 }
 
+// ================================================================
+// --- ABYSSAL LEVIATHAN BOSS ---
+// ================================================================
+const leviathan = {
+    alive: false, hp: 50, maxHp: 50,
+    x: 0, y: 0, // head position
+    phase: 1, state: 'inactive', // inactive, cinematic, idle, lunge_telegraph, lunge_strike, lunge_rest, body_arc, poison_spit, roar, dying, dead
+    headBaseX: 0, headBaseY: 0, // resting position at water edge
+    animTimer: 0, attackTimer: 5, attackCycle: 0,
+    // Lunge
+    lungeTarget: null, lungeShadow: 0,
+    lungeRestTimer: 0,
+    // Body arc
+    bodyArc: null, // {startSide, progress, y}
+    bodyArcTimer: 0,
+    // Poison spit
+    spitTimer: 0,
+    // Phase 2
+    crawlerSummonTimer: 15,
+    // Cinematic
+    cinematicTimer: 0, cinematicPhase: 0,
+    // Death
+    deathTimer: 0, drainProgress: 0,
+    // Hit
+    hitTimer: 0,
+    // Visual
+    headSway: 0, eyeTrackX: 0, eyeTrackY: 0,
+    mouthOpen: 0, waterDrips: [],
+    floorCracks: [], // permanent crack decals
+    activated: false,
+    introPlayed: false,
+    hpBarFill: 0, // 0-1 for dramatic fill
+};
+
+function activateLeviathan() {
+    leviathan.alive = true;
+    leviathan.hp = 50; leviathan.maxHp = 50;
+    leviathan.headBaseX = PLAY_OFFSET_X + PLAY_W / 2;
+    leviathan.headBaseY = PLAY_OFFSET_Y + 6.5 * TILE_SIZE; // water edge
+    leviathan.x = leviathan.headBaseX;
+    leviathan.y = leviathan.headBaseY;
+    leviathan.phase = 1;
+    leviathan.state = 'cinematic';
+    leviathan.cinematicTimer = 0;
+    leviathan.cinematicPhase = 0;
+    leviathan.activated = true;
+    leviathan.introPlayed = false;
+    leviathan.attackTimer = 3;
+    leviathan.bodyArcTimer = 8;
+    leviathan.spitTimer = 6;
+    leviathan.crawlerSummonTimer = 15;
+    leviathan.deathTimer = 0;
+    leviathan.drainProgress = 0;
+    leviathan.hpBarFill = 0;
+    leviathan.floorCracks = [];
+    leviathan.hitTimer = 0;
+    currentRoomData.lockedUntilClear = true;
+    currentRoomData._poisonPuddles = [];
+    tilesDirty = true;
+    playSound('door_lock');
+    triggerShake(3, 10);
+}
+
+function updateLeviathan(dt) {
+    if (!leviathan.activated || !leviathan.alive) return;
+    leviathan.animTimer += dt;
+    leviathan.headSway = Math.sin(leviathan.animTimer * 0.8) * 2;
+
+    // Eye tracking
+    const edx = player.x - leviathan.x, edy = player.y - leviathan.y;
+    leviathan.eyeTrackX += (Math.sign(edx) - leviathan.eyeTrackX) * dt * 3;
+    leviathan.eyeTrackY += (Math.sign(edy) - leviathan.eyeTrackY) * dt * 3;
+
+    // Mouth idle
+    leviathan.mouthOpen = Math.sin(leviathan.animTimer * 1.5) > 0.7 ? 1 : 0;
+
+    // Water drips from head
+    if (Math.random() < 0.05) {
+        leviathan.waterDrips.push({ x: leviathan.x + Math.random()*12-6, y: leviathan.y - 4, vy: 0, life: 0.5 });
+    }
+    for (let i = leviathan.waterDrips.length - 1; i >= 0; i--) {
+        const d = leviathan.waterDrips[i];
+        d.vy += 80 * dt; d.y += d.vy * dt; d.life -= dt;
+        if (d.life <= 0 || d.y > leviathan.headBaseY + 20) leviathan.waterDrips.splice(i, 1);
+    }
+
+    if (leviathan.hitTimer > 0) { leviathan.hitTimer -= dt; }
+
+    // Update poison puddles
+    const puddles = currentRoomData._poisonPuddles;
+    for (let i = puddles.length - 1; i >= 0; i--) {
+        puddles[i].life -= dt;
+        if (puddles[i].life <= 0) puddles.splice(i, 1);
+        else {
+            // Damage player in puddle
+            const pdx = player.x - puddles[i].x, pdy = player.y - puddles[i].y;
+            if (pdx*pdx + pdy*pdy < (puddles[i].radius * TILE_SIZE) * (puddles[i].radius * TILE_SIZE)) {
+                if (!player.poisonWard && player.alive && player.invincible <= 0) {
+                    if (Math.floor(leviathan.animTimer * 2) !== Math.floor((leviathan.animTimer - dt) * 2)) {
+                        damagePlayer(1, puddles[i].x, puddles[i].y);
+                    }
+                }
+            }
+        }
+    }
+
+    // BOSS_WATER damage to player
+    if (player.alive) {
+        const ptx = Math.floor((player.x - PLAY_OFFSET_X) / TILE_SIZE);
+        const pty = Math.floor((player.y - PLAY_OFFSET_Y) / TILE_SIZE);
+        if (ptx >= 0 && ptx < GRID_COLS && pty >= 0 && pty < GRID_ROWS) {
+            if (currentRoomData.tileMap[pty][ptx] === T.BOSS_WATER && leviathan.state !== 'dead') {
+                if (Math.floor(leviathan.animTimer * 2) !== Math.floor((leviathan.animTimer - dt) * 2)) {
+                    damagePlayer(2, player.x, player.y + 8);
+                }
+            }
+        }
+    }
+
+    // --- STATE MACHINE ---
+    if (leviathan.state === 'cinematic') {
+        updateLeviathanCinematic(dt);
+        return;
+    }
+    if (leviathan.state === 'dying') {
+        updateLeviathanDeath(dt);
+        return;
+    }
+    if (leviathan.state === 'roar') {
+        leviathan.cinematicTimer -= dt;
+        if (leviathan.cinematicTimer <= 0) leviathan.state = 'idle';
+        return;
+    }
+
+    // Phase transition check
+    if (leviathan.phase === 1 && leviathan.hp <= 25) {
+        leviathan.phase = 2;
+        leviathan.state = 'roar';
+        leviathan.cinematicTimer = 1.5;
+        leviathan.mouthOpen = 3;
+        triggerShake(6, 20);
+        playSound('leviathan_roar');
+        spawnBurst('splash', leviathan.x, leviathan.y, 20, { color: '#2a5a5a' });
+        return;
+    }
+
+    // Lunge telegraph
+    if (leviathan.state === 'lunge_telegraph') {
+        leviathan.lungeShadow += dt / (leviathan.phase === 2 ? 0.6 : 0.8);
+        // Head retracts toward water
+        leviathan.y = leviathan.headBaseY + leviathan.lungeShadow * 12;
+        if (leviathan.lungeShadow >= 1) {
+            // STRIKE!
+            leviathan.state = 'lunge_strike';
+            leviathan.lungeTarget = { x: player.x, y: player.y };
+            playSound('leviathan_impact');
+            triggerShake(5, 6);
+        }
+        return;
+    }
+
+    if (leviathan.state === 'lunge_strike') {
+        // Snap head to target
+        const tx = leviathan.lungeTarget.x, ty = leviathan.lungeTarget.y;
+        leviathan.x += (tx - leviathan.x) * 0.4;
+        leviathan.y += (ty - leviathan.y) * 0.4;
+        const ddx = player.x - tx, ddy = player.y - ty;
+        if (ddx*ddx + ddy*ddy < 48*48) damagePlayer(3, tx, ty);
+        // Add floor crack
+        leviathan.floorCracks.push({ x: tx, y: ty });
+        spawnBurst('bone_shatter', tx, ty, 8, { color: '#555555' });
+        spawnBurst('splash', tx, ty, 6, { color: '#2a5a5a' });
+        leviathan.state = 'lunge_rest';
+        leviathan.lungeRestTimer = leviathan.phase === 2 ? 1.5 : 2.5;
+        leviathan.mouthOpen = 2;
+        return;
+    }
+
+    if (leviathan.state === 'lunge_rest') {
+        // Head on ground - VULNERABLE
+        leviathan.lungeRestTimer -= dt;
+        if (leviathan.lungeRestTimer <= 0) {
+            // Retract to water
+            leviathan.state = 'idle';
+            leviathan.x = leviathan.headBaseX;
+            leviathan.y = leviathan.headBaseY;
+            leviathan.mouthOpen = 0;
+            playSound('leviathan_slide');
+            spawnBurst('splash', leviathan.headBaseX, leviathan.headBaseY, 6, { color: '#1a3a6a' });
+        }
+        return;
+    }
+
+    if (leviathan.state === 'body_arc') {
+        if (!leviathan.bodyArc) { leviathan.state = 'idle'; return; }
+        leviathan.bodyArc.progress += dt / 1.5;
+        if (leviathan.bodyArc.progress >= 1) {
+            leviathan.bodyArc = null;
+            leviathan.state = 'idle';
+            spawnBurst('splash', leviathan.headBaseX, leviathan.headBaseY + 10, 4, { color: '#1a3a6a' });
+            return;
+        }
+        // Check body collision with player
+        const arcProg = leviathan.bodyArc.progress;
+        const arcX = leviathan.bodyArc.startSide === 'left' ?
+            PLAY_OFFSET_X + arcProg * PLAY_W :
+            PLAY_OFFSET_X + (1 - arcProg) * PLAY_W;
+        const arcY = PLAY_OFFSET_Y + leviathan.bodyArc.y * TILE_SIZE + Math.sin(arcProg * Math.PI) * -30;
+        const adx = player.x - arcX, ady = player.y - arcY;
+        if (adx*adx + ady*ady < 24*24 && player.alive) {
+            damagePlayer(2, arcX, arcY);
+        }
+        return;
+    }
+
+    if (leviathan.state === 'poison_spit') {
+        leviathan.spitTimer -= dt;
+        if (leviathan.spitTimer <= 0) {
+            // Spit 3 poison globs
+            const baseAngle = Math.atan2(player.y - leviathan.y, player.x - leviathan.x);
+            for (let i = -1; i <= 1; i++) {
+                const a = baseAngle + i * 0.35;
+                const tx = leviathan.x + Math.cos(a) * 100;
+                const ty = leviathan.y + Math.sin(a) * 100;
+                // Landing position (clamped to arena)
+                const lx = Math.max(PLAY_OFFSET_X + 16, Math.min(PLAY_OFFSET_X + PLAY_W - 16, player.x + Math.cos(a) * 30 + Math.random()*40-20));
+                const ly = Math.max(PLAY_OFFSET_Y + 16, Math.min(PLAY_OFFSET_Y + 6 * TILE_SIZE, player.y + Math.sin(a) * 30 + Math.random()*30-15));
+                // Check if it hits a stalagmite
+                let hitStalag = false;
+                for (const st of currentRoomData._stalagmites) {
+                    if (st.alive) {
+                        const sx = PLAY_OFFSET_X + st.x * TILE_SIZE + 8;
+                        const sy = PLAY_OFFSET_Y + st.y * TILE_SIZE + 8;
+                        if (Math.abs(lx - sx) < 20 && Math.abs(ly - sy) < 20) {
+                            st.hp--;
+                            if (st.hp <= 0) {
+                                st.alive = false;
+                                currentRoomData.tileMap[st.y][st.x] = T.FLOOR;
+                                tilesDirty = true;
+                                spawnBurst('bone_shatter', sx, sy, 15, { color: '#555555' });
+                                playSound('crack');
+                            } else {
+                                spawnBurst('splash', sx, sy, 6, { color: '#44aa44' });
+                            }
+                            hitStalag = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hitStalag) {
+                    currentRoomData._poisonPuddles.push({ x: lx, y: ly, radius: 2, life: 8 });
+                }
+                spawnParticle('poison_cloud', lx, ly, { life: 1, size: 3, color: '#44cc33' });
+            }
+            playSound('leviathan_spit');
+            leviathan.mouthOpen = 0;
+            leviathan.state = 'idle';
+        }
+        return;
+    }
+
+    // IDLE — choose attacks
+    if (leviathan.state === 'idle') {
+        leviathan.x += (leviathan.headBaseX + leviathan.headSway - leviathan.x) * dt * 2;
+        leviathan.y += (leviathan.headBaseY - leviathan.y) * dt * 2;
+
+        leviathan.attackTimer -= dt;
+        leviathan.bodyArcTimer -= dt;
+
+        // Phase 2: poison spit
+        if (leviathan.phase === 2) {
+            leviathan.spitTimer -= dt;
+            leviathan.crawlerSummonTimer -= dt;
+            if (leviathan.crawlerSummonTimer <= 0) {
+                // Summon cave crawlers
+                for (let c = 0; c < 2; c++) {
+                    const sx = PLAY_OFFSET_X + (c === 0 ? 3 : 17) * TILE_SIZE;
+                    const sy = PLAY_OFFSET_Y + 6.5 * TILE_SIZE;
+                    spawnEnemy('cave_crawler', sx, sy, 0.5);
+                    spawnBurst('splash', sx, sy, 4, { color: '#1a3a6a' });
+                }
+                leviathan.crawlerSummonTimer = 15;
+                playSound('leviathan_splash');
+            }
+            if (leviathan.spitTimer <= 0 && leviathan.attackTimer > 1) {
+                leviathan.state = 'poison_spit';
+                leviathan.spitTimer = 0.6;
+                leviathan.mouthOpen = 3;
+                return;
+            }
+        }
+
+        // Body arc
+        if (leviathan.bodyArcTimer <= 0) {
+            leviathan.state = 'body_arc';
+            leviathan.bodyArc = {
+                startSide: Math.random() < 0.5 ? 'left' : 'right',
+                progress: 0,
+                y: 3 + Math.random() * 2
+            };
+            leviathan.bodyArcTimer = 8 + Math.random() * 2;
+            playSound('leviathan_slide');
+            const splashX = leviathan.bodyArc.startSide === 'left' ? PLAY_OFFSET_X + 10 : PLAY_OFFSET_X + PLAY_W - 10;
+            spawnBurst('splash', splashX, PLAY_OFFSET_Y + leviathan.bodyArc.y * TILE_SIZE, 6, { color: '#1a3a6a' });
+            return;
+        }
+
+        // Lunge attack
+        if (leviathan.attackTimer <= 0) {
+            leviathan.state = 'lunge_telegraph';
+            leviathan.lungeShadow = 0;
+            leviathan.attackTimer = leviathan.phase === 2 ? 4 : 5;
+            if (leviathan.phase === 2) leviathan.spitTimer = 6;
+            playSound('leviathan_hiss');
+            return;
+        }
+    }
+}
+
+function updateLeviathanCinematic(dt) {
+    leviathan.cinematicTimer += dt;
+    const t = leviathan.cinematicTimer;
+
+    if (t < 0.5) {
+        // Room darkens
+    } else if (t < 1.5) {
+        // Water churns
+        if (Math.random() < 0.3) {
+            const wx = leviathan.headBaseX + Math.random() * 80 - 40;
+            spawnParticle('splash', wx, leviathan.headBaseY + 20, { color: '#1a3a6a', vy: -20 });
+        }
+    } else if (t < 2.0 && leviathan.cinematicPhase === 0) {
+        // Shadow under water
+        leviathan.cinematicPhase = 1;
+    } else if (t < 2.5 && leviathan.cinematicPhase === 1) {
+        // Head erupts
+        leviathan.cinematicPhase = 2;
+        leviathan.y = leviathan.headBaseY;
+        spawnBurst('splash', leviathan.headBaseX, leviathan.headBaseY, 25, { color: '#2a5a5a' });
+        triggerShake(6, 10);
+        playSound('leviathan_roar');
+    } else if (t < 3.5 && leviathan.cinematicPhase === 2) {
+        // Head rises and roars
+        leviathan.y += (leviathan.headBaseY - 10 - leviathan.y) * dt * 3;
+        leviathan.mouthOpen = 3;
+    } else if (t < 4.0 && leviathan.cinematicPhase === 2) {
+        leviathan.cinematicPhase = 3;
+        leviathan.mouthOpen = 0;
+        leviathan.y = leviathan.headBaseY;
+    } else if (t >= 4.0) {
+        // Fight begins
+        leviathan.state = 'idle';
+        leviathan.introPlayed = true;
+    }
+}
+
+function updateLeviathanDeath(dt) {
+    leviathan.deathTimer += dt;
+    const t = leviathan.deathTimer;
+
+    if (t < 1.5) {
+        // Thrashing
+        leviathan.x = leviathan.headBaseX + Math.sin(t * 12) * 15;
+        leviathan.mouthOpen = 3;
+        if (Math.random() < 0.3) spawnBurst('splash', leviathan.x, leviathan.y, 4, { color: '#2a5a5a' });
+        triggerShake(3, 2);
+    } else if (t < 2.5) {
+        // Sinking
+        leviathan.y += dt * 20;
+        leviathan.mouthOpen = 1;
+    } else if (t < 3.5) {
+        // Silence, then drain
+        leviathan.alive = false;
+    } else if (t < 5.5) {
+        // Drain water
+        leviathan.drainProgress = Math.min(1, (t - 3.5) / 2);
+        if (t > 3.6 && t - dt <= 3.6) playSound('leviathan_drain');
+        // Convert boss water tiles to floor progressively
+        const drainRow = 9 - Math.floor(leviathan.drainProgress * 3);
+        for (let y = 9; y >= Math.max(7, drainRow); y--) {
+            for (let x = 1; x < GRID_COLS - 1; x++) {
+                if (currentRoomData.tileMap[y][x] === T.BOSS_WATER) {
+                    currentRoomData.tileMap[y][x] = T.FLOOR;
+                    tilesDirty = true;
+                }
+            }
+        }
+    } else if (t < 6.5) {
+        // Spawn loot on drained floor
+        if (t > 5.6 && t - dt <= 5.6) {
+            for (let i = 0; i < 25; i++) {
+                spawnPickup(
+                    PLAY_OFFSET_X + 5 * TILE_SIZE + Math.random() * 10 * TILE_SIZE,
+                    PLAY_OFFSET_Y + 8 * TILE_SIZE + Math.random() * TILE_SIZE,
+                    'gold', 1);
+            }
+            // Power-up item
+            const bossItems = ['boots_of_speed','fire_sword','throwing_daggers','ice_ring','vampire_fang','shadow_cloak'];
+            const available = bossItems.filter(i => !player.items.includes(i));
+            const pick = available.length > 0 ? available[Math.floor(Math.random()*available.length)] : 'boots_of_speed';
+            spawnPickup(PLAY_OFFSET_X + PLAY_W/2, PLAY_OFFSET_Y + 8 * TILE_SIZE, 'item', 0);
+            pickups[pickups.length-1]._itemId = pick;
+            // Kill remaining crawlers
+            for (const e of enemies) { if (e.alive) { e.hp = 0; killEnemy(e); } }
+            // Clear poison
+            currentRoomData._poisonPuddles = [];
+            playSound('leviathan_victory');
+        }
+    } else if (t < 7.0) {
+        // Floor clear text
+        if (t > 6.6 && t - dt <= 6.6) {
+            game.floorClear = { timer: 0, shown: false, floor: 2 };
+        }
+    } else {
+        // Done
+        leviathan.state = 'dead';
+        currentRoomData.lockedUntilClear = false;
+        tilesDirty = true;
+        clearedRooms.add(20);
+    }
+}
+
+function damageLeviathan(amount) {
+    if (!leviathan.alive || leviathan.state === 'dying' || leviathan.state === 'cinematic') return;
+    // Only hittable during lunge_rest
+    if (leviathan.state !== 'lunge_rest') return;
+    leviathan.hp -= amount;
+    leviathan.hitTimer = 0.12;
+    const isKill = leviathan.hp <= 0;
+    spawnDamageNumber(leviathan.x, leviathan.y - 12, amount, isKill ? 'crit' : 'normal');
+    spawnBurst('splash', leviathan.x, leviathan.y, isKill ? 15 : 5, { color: '#2a5a5a' });
+    addHitSpark((player.x + leviathan.x)/2, (player.y + leviathan.y)/2);
+    triggerHitFreeze(isKill ? 10 : 4);
+    triggerShake(isKill ? 8 : 3, isKill ? 20 : 4);
+    if (isKill) {
+        leviathan.hp = 0;
+        leviathan.state = 'dying';
+        leviathan.deathTimer = 0;
+        playSound('leviathan_roar');
+    }
+}
+
+function checkLeviathanHit() {
+    if (!leviathan.alive || leviathan.state !== 'lunge_rest') return;
+    if (player.state !== 'attack' || !player.swordArc || player.swordArc.life < 0.15) return;
+    const dx = leviathan.x - player.x, dy = leviathan.y - player.y;
+    if (dx*dx + dy*dy < 30*30) {
+        let dmg = 1;
+        if (player.fireSword || player.infernalBlade) dmg = 2;
+        if (player.infernalBlade) dmg = 3;
+        damageLeviathan(dmg);
+        playSound('hit');
+        game.combo.count++; game.combo.timer = 1.5;
+    }
+}
+
+function drawLeviathan(ctx, time) {
+    if (!leviathan.activated) return;
+    const room = currentRoomData;
+
+    // Draw poison puddles
+    if (room._poisonPuddles) {
+        for (const p of room._poisonPuddles) {
+            const alpha = Math.min(1, p.life / 2) * 0.4;
+            ctx.fillStyle = rgbStr(68, 170, 51, alpha);
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.radius * TILE_SIZE, 0, Math.PI * 2);
+            ctx.fill();
+            // Animated haze
+            ctx.fillStyle = rgbStr(68, 204, 51, alpha * 0.5 + Math.sin(time * 3 + p.x) * 0.1);
+            ctx.beginPath();
+            ctx.arc(p.x + Math.sin(time * 2) * 3, p.y + Math.cos(time * 2.5) * 3, p.radius * TILE_SIZE * 0.7, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    // Draw floor cracks
+    for (const c of leviathan.floorCracks) {
+        ctx.fillStyle = 'rgba(40,40,40,0.5)';
+        ctx.fillRect(c.x - 4, c.y - 1, 8, 2);
+        ctx.fillRect(c.x - 1, c.y - 4, 2, 8);
+        ctx.fillRect(c.x - 3, c.y - 3, 2, 2);
+    }
+
+    // Body arc
+    if (leviathan.state === 'body_arc' && leviathan.bodyArc) {
+        const arc = leviathan.bodyArc;
+        const prog = arc.progress;
+        ctx.fillStyle = '#1a3a3a';
+        for (let seg = -3; seg <= 3; seg++) {
+            const segProg = Math.max(0, Math.min(1, prog + seg * 0.05));
+            const sx = arc.startSide === 'left' ?
+                PLAY_OFFSET_X + segProg * PLAY_W :
+                PLAY_OFFSET_X + (1 - segProg) * PLAY_W;
+            const sy = PLAY_OFFSET_Y + arc.y * TILE_SIZE + Math.sin(segProg * Math.PI) * -30;
+            // Body segment
+            ctx.fillStyle = '#1a3a3a';
+            ctx.fillRect(Math.round(sx - 6), Math.round(sy - 5), 12, 10);
+            ctx.fillStyle = '#2a5a5a';
+            ctx.fillRect(Math.round(sx - 5), Math.round(sy + 2), 10, 3);
+            // Dorsal ridge
+            ctx.fillStyle = '#2a4a4a';
+            ctx.fillRect(Math.round(sx - 1), Math.round(sy - 7), 2, 3);
+        }
+    }
+
+    // Lunge shadow on ground
+    if (leviathan.state === 'lunge_telegraph') {
+        const shadowR = leviathan.lungeShadow * 24;
+        ctx.fillStyle = rgbStr(0, 0, 0, 0.15 + leviathan.lungeShadow * 0.2);
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, shadowR, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Cinematic shadow under water
+    if (leviathan.state === 'cinematic' && leviathan.cinematicPhase === 1) {
+        const shadowX = leviathan.headBaseX + Math.sin(leviathan.cinematicTimer * 4) * 40;
+        ctx.fillStyle = 'rgba(0,20,20,0.4)';
+        ctx.beginPath();
+        ctx.ellipse(shadowX, leviathan.headBaseY + 20, 30, 8, 0, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Don't draw head if fully sunk in death
+    if (leviathan.state === 'dying' && leviathan.deathTimer > 2.5) return;
+    if (leviathan.state === 'dead') return;
+    if (leviathan.state === 'cinematic' && leviathan.cinematicPhase < 2) return;
+
+    // Hit flash
+    if (leviathan.hitTimer > 0.06) {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(Math.round(leviathan.x - 10), Math.round(leviathan.y - 12), 20, 24);
+        return;
+    }
+
+    // Death fade
+    if (leviathan.state === 'dying') {
+        ctx.globalAlpha = Math.max(0, 1 - (leviathan.deathTimer - 1.5));
+    }
+
+    drawLeviathanHead(ctx, leviathan.x + leviathan.headSway, leviathan.y, time);
+
+    ctx.globalAlpha = 1;
+
+    // Water drips
+    for (const d of leviathan.waterDrips) {
+        ctx.fillStyle = rgbStr(26, 58, 106, 0.6);
+        ctx.fillRect(Math.round(d.x), Math.round(d.y), 1, 2);
+    }
+
+    // HP bar (bottom of screen)
+    if (leviathan.introPlayed && leviathan.alive) {
+        leviathan.hpBarFill = Math.min(1, leviathan.hpBarFill + 0.02);
+        const barW = 100, barH = 4;
+        const barX = INTERNAL_W / 2 - barW / 2;
+        const barY = INTERNAL_H - 12;
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(barX - 2, barY - 8, barW + 4, barH + 12);
+        ctx.fillStyle = '#222222';
+        ctx.fillRect(barX, barY, barW, barH);
+        const hpFrac = (leviathan.hp / leviathan.maxHp) * leviathan.hpBarFill;
+        const hpCol = leviathan.phase === 2 ? '#44cc88' : '#2288aa';
+        ctx.fillStyle = hpCol;
+        ctx.fillRect(barX, barY, barW * hpFrac, barH);
+        queueText('THE ABYSSAL LEVIATHAN', INTERNAL_W / 2, barY - 2, 4, '#66ddcc', 'center');
+    }
+
+    // Cinematic darkening
+    if (leviathan.state === 'cinematic' && leviathan.cinematicTimer < 2) {
+        const darkAlpha = Math.min(0.4, leviathan.cinematicTimer * 0.3);
+        ctx.fillStyle = rgbStr(0, 0, 0, darkAlpha);
+        ctx.fillRect(0, 0, INTERNAL_W, INTERNAL_H);
+    }
+}
+
+function drawLeviathanHead(ctx, hx, hy, time) {
+    const mx = Math.round(hx), my = Math.round(hy);
+    const mouthGap = leviathan.mouthOpen * 2;
+
+    // Neck emerging from water
+    ctx.fillStyle = '#1a3a3a';
+    ctx.fillRect(mx - 5, my + 4, 10, 16);
+    ctx.fillStyle = '#2a5a5a';
+    ctx.fillRect(mx - 4, my + 6, 8, 12);
+
+    // Head body (elongated serpentine)
+    ctx.fillStyle = '#1a3a3a';
+    ctx.fillRect(mx - 10, my - 12, 20, 16 + mouthGap);
+    ctx.fillRect(mx - 9, my - 13, 18, 1);
+    // Underbelly
+    ctx.fillStyle = '#2a5a5a';
+    ctx.fillRect(mx - 8, my + 1, 16, 3 + mouthGap);
+    // Scale texture
+    ctx.fillStyle = '#224444';
+    for (let sy = -10; sy < 2; sy += 3) {
+        for (let sx = -8; sx < 8; sx += 4) {
+            ctx.fillRect(mx + sx, my + sy, 2, 1);
+        }
+    }
+
+    // Eyes (glowing yellow-green)
+    const eyeColor = leviathan.phase === 2 ? '#dddd44' : '#aaddaa';
+    const eyeGlow = Math.sin(time * 2) * 0.15 + 0.85;
+    ctx.fillStyle = rgbStr(...hexToRgb(eyeColor), eyeGlow);
+    ctx.fillRect(mx - 7, my - 9, 3, 3);
+    ctx.fillRect(mx + 4, my - 9, 3, 3);
+    // Slit pupils
+    ctx.fillStyle = '#111111';
+    const pupilOff = Math.round(leviathan.eyeTrackX);
+    ctx.fillRect(mx - 6 + pupilOff, my - 9, 1, 3);
+    ctx.fillRect(mx + 5 + pupilOff, my - 9, 1, 3);
+
+    // Bioluminescent spots
+    ctx.fillStyle = rgbStr(68, 255, 204, 0.5 + Math.sin(time * 1.5) * 0.2);
+    ctx.fillRect(mx - 2, my - 11, 1, 1);
+    ctx.fillRect(mx + 1, my - 11, 1, 1);
+    ctx.fillRect(mx, my - 12, 1, 1);
+
+    // Mouth
+    if (mouthGap > 0) {
+        // Open mouth
+        ctx.fillStyle = '#4a1a1a';
+        ctx.fillRect(mx - 8, my + 1, 16, mouthGap + 2);
+        // Teeth
+        ctx.fillStyle = '#ffffff';
+        for (let t = -6; t <= 5; t += 2) {
+            ctx.fillRect(mx + t, my, 1, 2);
+            ctx.fillRect(mx + t, my + mouthGap + 1, 1, 2);
+        }
+    } else {
+        // Closed mouth line
+        ctx.fillStyle = '#0a2a2a';
+        ctx.fillRect(mx - 8, my + 2, 16, 1);
+    }
+}
+
 // --- PUSH BLOCK MECHANICS ---
 function updatePushBlock(dt) {
     if (!currentRoomData._pushBlock || puzzleState.plateSolved) return;
@@ -5108,6 +5750,103 @@ function checkAmbushTrigger() {
     }
 }
 
+// --- MIMIC ROOM LOGIC ---
+function updateMimicRoom(dt) {
+    const room = currentRoomData;
+    if (!room._mimicRoom) return;
+    const realIndices = room._mimicRealChests || [];
+
+    // Check if first mimic was killed — activate all remaining
+    if (!room._mimicAllActivated) {
+        let anyMimicDead = false;
+        let anyMimicActive = false;
+        for (let i = 0; i < enemies.length; i++) {
+            const e = enemies[i];
+            if (e.type !== 'mimic') continue;
+            if (realIndices.includes(i)) continue; // skip real chests
+            if (!e.alive && e.mimicActive) anyMimicDead = true;
+            if (e.mimicActive) anyMimicActive = true;
+        }
+        // If any mimic died, activate all remaining dormant mimics
+        if (anyMimicDead && !room._mimicFirstKilled) {
+            room._mimicFirstKilled = true;
+        }
+        if (room._mimicFirstKilled && !room._mimicAllActivated) {
+            let anyActivated = false;
+            for (let i = 0; i < enemies.length; i++) {
+                const e = enemies[i];
+                if (e.type !== 'mimic') continue;
+                if (realIndices.includes(i)) continue;
+                if (e.alive && !e.mimicActive) {
+                    e.mimicActive = true;
+                    triggerShake(3, 4);
+                    spawnDamageNumber(e.x, e.y - 10, '!', 'crit');
+                    anyActivated = true;
+                }
+            }
+            if (anyActivated) {
+                playSound('door_lock');
+                currentRoomData.lockedUntilClear = true;
+                tilesDirty = true;
+            }
+            room._mimicAllActivated = true;
+        }
+        // Lock doors when first mimic activates
+        if (anyMimicActive && !currentRoomData.lockedUntilClear) {
+            currentRoomData.lockedUntilClear = true;
+            tilesDirty = true;
+            playSound('door_lock');
+        }
+    }
+
+    // Handle "real chest" mimics — they give loot when player approaches instead of attacking
+    for (const idx of realIndices) {
+        if (idx >= enemies.length) continue;
+        const e = enemies[idx];
+        if (!e.alive || e.mimicActive) continue;
+        const dx = player.x - e.x, dy = player.y - e.y;
+        if (dx*dx + dy*dy < 24*24 && player.alive) {
+            // "Open" as real chest - give loot and remove
+            e.alive = false;
+            const lootKey = room._mimicChestLoot[idx];
+            if (lootKey === 'gold_15') {
+                for (let g = 0; g < 15; g++) spawnPickup(e.x + Math.random()*16-8, e.y + Math.random()*16-8, 'gold', 1);
+            } else if (lootKey === 'powerup') {
+                const items = ['boots_of_speed','fire_sword','throwing_daggers','ice_ring','vampire_fang','shadow_cloak','aqua_boots','poison_ward'];
+                const avail = items.filter(i => !player.items.includes(i));
+                const pick = avail.length > 0 ? avail[Math.floor(Math.random()*avail.length)] : 'boots_of_speed';
+                spawnPickup(e.x, e.y, 'item', 0);
+                pickups[pickups.length-1]._itemId = pick;
+            }
+            playSound('chest_open');
+            spawnBurst('gold_sparkle', e.x, e.y, 10);
+        }
+    }
+}
+
+// --- HEALING SPRING ---
+let healSpringTimer = 0;
+function updateHealSpring(dt) {
+    const spring = currentRoomData._healSpring;
+    if (!spring || spring.healsUsed >= spring.maxHeals) return;
+    // Check if player is in the healing pool
+    const px = Math.floor((player.x - PLAY_OFFSET_X) / TILE_SIZE);
+    const py = Math.floor((player.y - PLAY_OFFSET_Y) / TILE_SIZE);
+    if (px >= spring.x && px < spring.x + spring.w && py >= spring.y && py < spring.y + spring.h) {
+        healSpringTimer += dt;
+        if (healSpringTimer >= 3 && player.health < player.maxHealth) {
+            healSpringTimer = 0;
+            spring.healsUsed++;
+            player.health = Math.min(player.maxHealth, player.health + 2);
+            spawnDamageNumber(player.x, player.y - 10, '+1', 'heal');
+            spawnBurst('gold_sparkle', player.x, player.y, 6, { color: '#44ffcc' });
+            playSound('heal');
+        }
+    } else {
+        healSpringTimer = 0;
+    }
+}
+
 // --- THROWING DAGGER ---
 function updateDagger(dt) {
     if (!player.throwDaggers) return;
@@ -5186,8 +5925,11 @@ function drawFloorClear(ctx) {
     ctx.fillStyle = 'rgba(0,0,0,0.6)';
     ctx.fillRect(0, INTERNAL_H/2 - 25, INTERNAL_W, 50);
     ctx.globalAlpha = 1;
-    queueText('FLOOR 1 CLEARED', INTERNAL_W/2, INTERNAL_H/2 - 8, 9, '#ffd700', 'center', alpha);
-    queueText('The Forgotten Catacombs', INTERNAL_W/2, INTERNAL_H/2 + 2, 5, '#aaaaaa', 'center', alpha);
+    const floorNum = (game.floorClear && game.floorClear.floor) || 1;
+    const floorNames = { 1: 'The Forgotten Catacombs', 2: 'The Sunken Caves', 3: 'The Infernal Forge' };
+    const floorColors = { 1: '#ffd700', 2: '#44ffcc', 3: '#ff6622' };
+    queueText(`FLOOR ${floorNum} CLEARED`, INTERNAL_W/2, INTERNAL_H/2 - 8, 9, floorColors[floorNum] || '#ffd700', 'center', alpha);
+    queueText(floorNames[floorNum] || '', INTERNAL_W/2, INTERNAL_H/2 + 2, 5, '#aaaaaa', 'center', alpha);
     ctx.fillStyle = '#888888';
     queueText(`Gold: ${player.gold}  Items: ${player.items.length}`, INTERNAL_W/2, INTERNAL_H/2 + 14, 4, '#888888', 'center', alpha);
 }
@@ -5434,7 +6176,7 @@ const room14 = {
 // ROOM 15: The Drowned Tombs (puzzle)
 const room15 = {
     id: 15, name: 'The Drowned Tombs', floor: 2, type: 'puzzle',
-    doors: { north: 21, south: 14, east: false, west: false },
+    doors: { north: false, south: 14, east: 16, west: false },
     lockedUntilClear: false,
     tileMap: (() => {
         const m = makeBaseMap();
@@ -5477,6 +6219,255 @@ const room15 = {
     _platePos: { x: 3, y: 1, w: 1, h: 1 }, // plate 3 for block
 };
 
+// ROOM 16: The Spore Swamp
+const room16 = {
+    id: 16, name: 'The Spore Swamp', floor: 2, type: 'combat',
+    doors: { north: false, south: false, east: 17, west: 15 },
+    lockedUntilClear: true,
+    tileMap: (() => {
+        const m = makeBaseMap();
+        // Fill with shallow water (swamp)
+        for (let y = 1; y < GRID_ROWS-1; y++)
+            for (let x = 1; x < GRID_COLS-1; x++) m[y][x] = T.SHALLOW;
+        // Entry island (west) ~4x4
+        for (let y = 4; y <= 7; y++) for (let x = 1; x <= 4; x++) m[y][x] = T.FLOOR;
+        // Island 1 (3x3) NE of entry
+        for (let y = 2; y <= 4; y++) for (let x = 7; x <= 9; x++) m[y][x] = T.FLOOR;
+        // Island 2 (2x2) east of island 1
+        for (let y = 3; y <= 4; y++) for (let x = 12; x <= 13; x++) m[y][x] = T.FLOOR;
+        // Island 3 (3x3) south path
+        for (let y = 7; y <= 9; y++) for (let x = 8; x <= 10; x++) m[y][x] = T.FLOOR;
+        // Island 4 (2x2) near east exit
+        for (let y = 4; y <= 5; y++) for (let x = 16; x <= 17; x++) m[y][x] = T.FLOOR;
+        // Tiny mound for spore enemy 3
+        m[5][14] = T.FLOOR;
+        // Log bridges
+        m[4][5] = T.LOG_BRIDGE; m[3][6] = T.LOG_BRIDGE; // Entry to Island 1
+        m[3][10] = T.LOG_BRIDGE; m[3][11] = T.LOG_BRIDGE; // Island 1 to Island 2
+        m[4][14] = T.LOG_BRIDGE; m[4][15] = T.LOG_BRIDGE; // Island 2 area to Island 4
+        m[6][9] = T.LOG_BRIDGE; // Island 1 area to Island 3
+        return m;
+    })(),
+    enemies: [
+        { type: 'mushroom_spore', x: 8, y: 3 },  // Island 1
+        { type: 'mushroom_spore', x: 9, y: 8 },  // Island 3
+        { type: 'mushroom_spore', x: 14, y: 5 },  // Tiny mound
+        { type: 'cave_crawler', x: 5, y: 2 },
+        { type: 'cave_crawler', x: 11, y: 7 },
+        { type: 'cave_crawler', x: 15, y: 8 },
+        { type: 'cave_crawler', x: 3, y: 9 },
+    ],
+    props: [
+        { type: T.PROP_MUSHROOM, x: 7, y: 2 },
+        { type: T.PROP_MUSHROOM, x: 9, y: 4 },
+        { type: T.PROP_MUSHROOM, x: 8, y: 7 },
+        { type: T.PROP_MUSHROOM, x: 10, y: 9 },
+        { type: T.PROP_CRYSTAL, x: 10, y: 1 },
+        { type: T.PROP_BARREL, x: 2, y: 4 },
+    ],
+    hazards: [],
+    lightSources: [
+        { x: 8, y: 3, radius: 3, color: '#7a3a9a' },
+        { x: 9, y: 8, radius: 3, color: '#7a3a9a' },
+        { x: 14, y: 5, radius: 3, color: '#7a3a9a' },
+        { x: 7, y: 2, radius: 2.5, color: '#44ffcc' },
+        { x: 10, y: 9, radius: 2.5, color: '#44ffcc' },
+        { x: 10, y: 1, radius: 3, color: '#aabbdd' },
+    ],
+    particles: [
+        { preset: 'poison_cloud', area: { x: 1, y: 1, w: 18, h: 9 }, density: 0.03 },
+        { preset: 'dust', area: { x: 1, y: 1, w: 18, h: 9 }, density: 0.02 },
+    ],
+    secrets: [], chests: [],
+    _pickups: [{ x: 2, y: 5, type: 'heart', value: 2 }],
+};
+
+// ROOM 17: The Mimic's Den
+const room17 = {
+    id: 17, name: "The Mimic's Den", floor: 2, type: 'combat',
+    doors: { north: 18, south: false, east: false, west: 16 },
+    lockedUntilClear: false, // locks dynamically when mimic triggers
+    tileMap: (() => {
+        const m = makeBaseMap();
+        // Mostly open floor
+        // Small decorative puddle in SE corner
+        m[8][16] = T.SHALLOW; m[8][17] = T.SHALLOW;
+        m[9][16] = T.SHALLOW; m[9][17] = T.SHALLOW;
+        // A few wall obstacles for combat
+        m[2][4] = T.WALL; m[7][15] = T.WALL;
+        return m;
+    })(),
+    enemies: [
+        // 3 mimics positioned in pentagon pattern
+        { type: 'mimic', x: 10, y: 5 },  // Center - actually REAL chest, handled by _mimicRoom
+        { type: 'mimic', x: 5, y: 2 },   // NW - MIMIC
+        { type: 'mimic', x: 15, y: 2 },  // NE - actually REAL chest
+        { type: 'mimic', x: 5, y: 8 },   // SW - MIMIC
+        { type: 'mimic', x: 15, y: 8 },  // SE - MIMIC
+    ],
+    props: [
+        { type: T.PROP_BONES, x: 3, y: 5 },
+        { type: T.PROP_BONES, x: 12, y: 8 },
+        { type: T.PROP_BONES, x: 7, y: 3 },
+        { type: T.PROP_BONES, x: 16, y: 5 },
+        { type: T.PROP_SKULL, x: 8, y: 7 },
+        { type: T.PROP_SKULL, x: 13, y: 3 },
+    ],
+    hazards: [],
+    lightSources: [
+        { x: 10, y: 5, radius: 2, color: '#ffcc66' },
+        { x: 5, y: 2, radius: 1.5, color: '#ffcc66' },
+        { x: 15, y: 2, radius: 1.5, color: '#ffcc66' },
+        { x: 5, y: 8, radius: 1.5, color: '#ffcc66' },
+        { x: 15, y: 8, radius: 1.5, color: '#ffcc66' },
+        { x: 2, y: 1, radius: 2, color: '#44ffcc' },
+    ],
+    particles: [
+        { preset: 'dust', area: { x: 1, y: 1, w: 18, h: 9 }, density: 0.01 },
+    ],
+    secrets: [], chests: [],
+    // Custom mimic room data
+    _mimicRoom: true,
+    _mimicRealChests: [0, 2], // indices into enemies array that are REAL chests (center, NE)
+    _mimicChestLoot: { 0: 'gold_15', 2: 'powerup' }, // loot for real chests
+    _mimicFirstKilled: false,
+    _mimicAllActivated: false,
+};
+
+// ROOM 18: The Necromancer's Lair
+const room18 = {
+    id: 18, name: "The Necromancer's Lair", floor: 2, type: 'combat',
+    doors: { north: 19, south: 17, east: false, west: false },
+    lockedUntilClear: true,
+    tileMap: (() => {
+        const m = makeBaseMap();
+        // Upper platform (north 40%, rows 1-4) - raised stone
+        for (let y = 1; y <= 4; y++)
+            for (let x = 1; x < GRID_COLS-1; x++) m[y][x] = T.WALL;
+        // Platform surface is walkable (row 1-3, accessible via ramp)
+        for (let y = 1; y <= 3; y++)
+            for (let x = 2; x < GRID_COLS-2; x++) m[y][x] = T.FLOOR;
+        // Platform front edge (row 4) is wall (can't climb)
+        // Ramp on east side (col 16-17, rows 4-7)
+        m[4][16] = T.FLOOR; m[4][17] = T.FLOOR;
+        m[5][17] = T.FLOOR; m[5][16] = T.FLOOR;
+        // Lower level open area
+        // Water puddle in SW corner
+        m[8][1] = T.SHALLOW; m[8][2] = T.SHALLOW; m[8][3] = T.SHALLOW; m[8][4] = T.SHALLOW;
+        m[9][1] = T.SHALLOW; m[9][2] = T.SHALLOW; m[9][3] = T.SHALLOW; m[9][4] = T.SHALLOW;
+        // Stalagmites on lower level for cover
+        m[7][6] = T.WALL; m[6][12] = T.WALL;
+        return m;
+    })(),
+    enemies: [
+        { type: 'necromancer', x: 10, y: 2 },
+        { type: 'skeleton_warrior', x: 6, y: 7 },
+        { type: 'skeleton_warrior', x: 14, y: 8 },
+    ],
+    props: [
+        { type: T.PROP_CRYSTAL, x: 5, y: 1 },
+        { type: T.PROP_CRYSTAL, x: 15, y: 1 },
+    ],
+    hazards: [],
+    lightSources: [
+        { x: 10, y: 2, radius: 5, color: '#aa55ff' },
+        { x: 5, y: 1, radius: 2, color: '#aa55ff' },
+        { x: 15, y: 1, radius: 2, color: '#aa55ff' },
+        { x: 3, y: 7, radius: 3, color: '#44ffcc' },
+        { x: 16, y: 7, radius: 2, color: '#44ffcc' },
+    ],
+    particles: [
+        { preset: 'dust', area: { x: 1, y: 5, w: 18, h: 4 }, density: 0.02 },
+        { preset: 'poison_cloud', area: { x: 4, y: 1, w: 12, h: 3 }, density: 0.008 },
+    ],
+    secrets: [], chests: [],
+};
+
+// ROOM 19: The Bioluminescent Depths (rest room)
+const room19 = {
+    id: 19, name: 'The Bioluminescent Depths', floor: 2, type: 'rest',
+    doors: { north: 20, south: 18, east: false, west: false },
+    lockedUntilClear: false,
+    tileMap: (() => {
+        const m = makeBaseMap();
+        // Healing spring pool in center (4x4)
+        for (let y = 4; y <= 7; y++)
+            for (let x = 8; x <= 11; x++) m[y][x] = T.HEAL_WATER;
+        // Large crystal formation east wall
+        m[3][16] = T.WALL; m[3][17] = T.WALL; m[4][16] = T.WALL; m[4][17] = T.WALL;
+        m[5][17] = T.WALL;
+        return m;
+    })(),
+    enemies: [],
+    props: [
+        { type: T.PROP_MUSHROOM, x: 2, y: 2 },
+        { type: T.PROP_MUSHROOM, x: 4, y: 8 },
+        { type: T.PROP_MUSHROOM, x: 14, y: 3 },
+        { type: T.PROP_MUSHROOM, x: 6, y: 1 },
+        { type: T.PROP_MUSHROOM, x: 17, y: 8 },
+        { type: T.PROP_CRYSTAL, x: 16, y: 3 },
+        { type: T.PROP_CRYSTAL, x: 17, y: 5 },
+        { type: T.PROP_CRYSTAL, x: 3, y: 5 },
+    ],
+    hazards: [],
+    lightSources: [
+        { x: 10, y: 5, radius: 6, color: '#66ffdd' },
+        { x: 16, y: 4, radius: 5, color: '#aaddff' },
+        { x: 2, y: 2, radius: 3, color: '#44ffcc' },
+        { x: 4, y: 8, radius: 3, color: '#44ffcc' },
+        { x: 14, y: 3, radius: 3, color: '#44ffcc' },
+        { x: 6, y: 1, radius: 2, color: '#44ffcc' },
+        { x: 17, y: 8, radius: 2, color: '#44ffcc' },
+        { x: 3, y: 5, radius: 3, color: '#aaddff' },
+    ],
+    particles: [
+        { preset: 'dust', area: { x: 1, y: 1, w: 18, h: 9 }, density: 0.06 },
+        { preset: 'gold_sparkle', area: { x: 8, y: 4, w: 4, h: 4 }, density: 0.01 },
+    ],
+    secrets: [], chests: [],
+    _pickups: [{ x: 14, y: 8, type: 'gold', value: 5 }],
+    _healSpring: { x: 8, y: 4, w: 4, h: 4, maxHeals: 3, healsUsed: 0 },
+    _secretWall: { x: 17, y: 1, hp: 3 },
+    _secretChest: { x: 18, y: 1, lootTable: ['shadow_cloak', 'vampire_fang', 'poison_ward'] },
+};
+
+// ROOM 20: BOSS — The Abyssal Leviathan
+const room20 = {
+    id: 20, name: 'The Abyssal Leviathan', floor: 2, type: 'boss',
+    doors: { north: 21, south: 19, east: false, west: false },
+    lockedUntilClear: false, // locks on boss activation
+    tileMap: (() => {
+        const m = makeBaseMap();
+        // Upper 2/3 = dry arena (rows 1-6)
+        // Lower 1/3 = deep boss water (rows 7-9)
+        for (let y = 7; y <= 9; y++)
+            for (let x = 1; x < GRID_COLS-1; x++) m[y][x] = T.BOSS_WATER;
+        // Stalagmite obstacles on arena floor
+        m[3][5] = T.WALL; m[2][12] = T.WALL; m[5][15] = T.WALL;
+        return m;
+    })(),
+    enemies: [],
+    props: [],
+    hazards: [],
+    lightSources: [
+        { x: 10, y: 8, radius: 4, color: '#224466' },
+        { x: 5, y: 3, radius: 2, color: '#44ffcc' },
+        { x: 15, y: 2, radius: 2, color: '#44ffcc' },
+    ],
+    particles: [
+        { preset: 'dust', area: { x: 1, y: 1, w: 18, h: 6 }, density: 0.01 },
+    ],
+    secrets: [], chests: [],
+    _bossRoom: 'leviathan',
+    // Stalagmite state for boss fight (breakable)
+    _stalagmites: [
+        { x: 5, y: 3, hp: 2, alive: true },
+        { x: 12, y: 2, hp: 2, alive: true },
+        { x: 15, y: 5, hp: 2, alive: true },
+    ],
+    _poisonPuddles: [], // {x, y, radius, life}
+};
+
 // ================================================================
 // --- FLOOR 3: THE INFERNAL FORGE (Rooms 21-25) ---
 // ================================================================
@@ -5484,7 +6475,7 @@ const room15 = {
 // ROOM 21: The Scorched Threshold
 const room21 = {
     id: 21, name: 'The Scorched Threshold', floor: 3, type: 'combat',
-    doors: { north: false, south: 15, east: 22, west: false },
+    doors: { north: false, south: 20, east: 22, west: false },
     lockedUntilClear: true,
     tileMap: (() => {
         const m = makeBaseMap();
@@ -6019,6 +7010,7 @@ function handleVictoryClick(ix, iy) {
 const rooms = { 1: room1, 2: room2, 3: room3, 4: room4, 5: room5,
     6: room6, 7: room7, 8: room8, 9: room9, 10: room10,
     11: room11, 12: room12, 13: room13, 14: room14, 15: room15,
+    16: room16, 17: room17, 18: room18, 19: room19, 20: room20,
     21: room21, 22: room22, 23: room23, 24: room24, 25: room25,
     26: room26, 27: room27, 28: room28, 29: room29, 30: room30 };
 const visitedRooms = new Set([1]);
@@ -6071,6 +7063,23 @@ function loadRoom(roomId) {
     // Reset boss for room 10
     if (roomId === 10 && !alreadyCleared) {
         boss.activated = false; boss.alive = false;
+    }
+    // Reset Leviathan for room 20
+    if (roomId === 20 && !alreadyCleared) {
+        leviathan.activated = false; leviathan.alive = false;
+        leviathan.state = 'inactive';
+    }
+    // Reset mimic room
+    if (roomId === 17 && !alreadyCleared) {
+        currentRoomData._mimicFirstKilled = false;
+        currentRoomData._mimicAllActivated = false;
+    }
+    // Reset healing spring
+    if (roomId === 19) {
+        healSpringTimer = 0;
+        if (!alreadyCleared && currentRoomData._healSpring) {
+            currentRoomData._healSpring.healsUsed = 0;
+        }
     }
 
     // Only spawn enemies if room hasn't been cleared yet
@@ -6144,6 +7153,7 @@ function prerenderTiles() {
                 case T.SHALLOW: case T.DEEP_WATER: case T.CURRENT_S: case T.CURRENT_E: case T.POISON_MUSH: case T.BRIDGE:
                 case T.CONVEYOR_E: case T.CONVEYOR_W: case T.CONVEYOR_N: case T.CONVEYOR_S:
                 case T.GEYSER_TILE: case T.LAVA_FORGE: case T.METAL_GRATE:
+                case T.LOG_BRIDGE: case T.HEAL_WATER: case T.BOSS_WATER:
                     // Rendered dynamically
                     renderFloorTile(tctx, px, py, theme, rng);
                     break;
@@ -6189,6 +7199,47 @@ function drawRoom(ctx, time) {
             else if (tile === T.CURRENT_S || tile === T.CURRENT_E) renderCaveWater(ctx, px, py, rng, time, true);
             else if (tile === T.DEEP_WATER) renderDeepWater(ctx, px, py, rng, time);
             else if (tile === T.BRIDGE) { renderCaveWater(ctx, px, py, rng, time, false); ctx.fillStyle='#4a4a44'; ctx.fillRect(px+1,py,TILE_SIZE-2,TILE_SIZE); }
+            else if (tile === T.LOG_BRIDGE) {
+                // Shallow water underneath + wooden log on top
+                renderCaveWater(ctx, px, py, rng, time, false);
+                ctx.fillStyle = '#5a4030'; ctx.fillRect(px, py+3, TILE_SIZE, 10);
+                ctx.fillStyle = '#6a5040'; ctx.fillRect(px, py+4, TILE_SIZE, 8);
+                ctx.fillStyle = '#4a3020'; ctx.fillRect(px, py+3, TILE_SIZE, 1);
+                ctx.fillRect(px, py+12, TILE_SIZE, 1);
+                // Moss patches
+                if (rng.nextBool(0.3)) { ctx.fillStyle = '#3a6a3a'; ctx.fillRect(px+rng.nextInt(2,10), py+5, 2, 2); }
+            }
+            else if (tile === T.HEAL_WATER) {
+                // Crystal clear healing pool
+                const ts = TILE_SIZE;
+                ctx.fillStyle = '#1a4a5a';
+                ctx.fillRect(px, py, ts, ts);
+                // Bright teal glow from below
+                const glowAmt = 0.3 + Math.sin(time * 1.5 + px * 0.1) * 0.1;
+                ctx.fillStyle = rgbStr(68, 255, 220, glowAmt);
+                ctx.fillRect(px + 2, py + 2, ts - 4, ts - 4);
+                // Gentle ripples
+                const ripple = Math.sin(time * 2 + px * 0.3 + py * 0.3);
+                ctx.fillStyle = rgbStr(100, 255, 240, 0.15 + ripple * 0.05);
+                ctx.fillRect(px + 4, py + Math.floor(ripple * 2 + 6), ts - 8, 1);
+                // Sparkle
+                if (Math.random() < 0.01) spawnParticle('gold_sparkle', px + Math.random()*ts, py + Math.random()*ts, { color: '#66ffdd', life: 0.6 });
+            }
+            else if (tile === T.BOSS_WATER) {
+                // Deep ominous boss water
+                const ts = TILE_SIZE;
+                ctx.fillStyle = '#0a1a2e';
+                ctx.fillRect(px, py, ts, ts);
+                ctx.fillStyle = rgbStr(10, 30, 50, 0.8 + Math.sin(time * 0.8 + px * 0.2) * 0.1);
+                ctx.fillRect(px, py, ts, ts);
+                // Surface ripple
+                if (y === 7) {
+                    ctx.fillStyle = rgbStr(40, 80, 120, 0.3 + Math.sin(time * 1.5 + px * 0.4) * 0.1);
+                    ctx.fillRect(px, py, ts, 2);
+                }
+                // Occasional bubble
+                if (Math.random() < 0.003) spawnParticle('splash', px + Math.random()*ts, py, { vy: -8, color: '#2a4a6a', life: 0.5, gravity: 0, size: 1 });
+            }
             else if (tile === T.POISON_MUSH) {
                 renderFloorTile(ctx, px, py, floorThemes[currentRoomData.floor], rng);
                 ctx.fillStyle = rgbStr(122,58,154, 0.15 + Math.sin(time*2+px)*0.05);
@@ -6990,6 +8041,171 @@ function playSound(type, pitchMult) {
             src4.start(now);
             break;
         }
+        // --- LEVIATHAN BOSS SOUNDS ---
+        case 'leviathan_roar': {
+            // Deep bellow + mid scream + high shriek
+            const o1 = audioCtx.createOscillator(); const g1 = audioCtx.createGain();
+            o1.type = 'sawtooth'; o1.frequency.setValueAtTime(60, now);
+            o1.frequency.exponentialRampToValueAtTime(40, now + 1.5);
+            g1.gain.setValueAtTime(0.14, now);
+            g1.gain.exponentialRampToValueAtTime(0.001, now + 1.5);
+            o1.connect(g1).connect(audioCtx.destination);
+            o1.start(now); o1.stop(now + 1.5);
+            // Mid layer
+            const o2 = audioCtx.createOscillator(); const g2 = audioCtx.createGain();
+            o2.type = 'sawtooth'; o2.frequency.setValueAtTime(400, now + 0.2);
+            const lfo = audioCtx.createOscillator(); const lfoG = audioCtx.createGain();
+            lfo.frequency.value = 8; lfoG.gain.value = 80;
+            lfo.connect(lfoG).connect(o2.frequency);
+            lfo.start(now + 0.2); lfo.stop(now + 1.3);
+            g2.gain.setValueAtTime(0.08, now + 0.2);
+            g2.gain.exponentialRampToValueAtTime(0.001, now + 1.2);
+            o2.connect(g2).connect(audioCtx.destination);
+            o2.start(now + 0.2); o2.stop(now + 1.3);
+            // High shriek
+            const o3 = audioCtx.createOscillator(); const g3 = audioCtx.createGain();
+            o3.type = 'sine'; o3.frequency.setValueAtTime(1200, now + 0.5);
+            o3.frequency.exponentialRampToValueAtTime(2000, now + 1.0);
+            g3.gain.setValueAtTime(0.04, now + 0.5);
+            g3.gain.exponentialRampToValueAtTime(0.001, now + 1.0);
+            o3.connect(g3).connect(audioCtx.destination);
+            o3.start(now + 0.5); o3.stop(now + 1.0);
+            break;
+        }
+        case 'leviathan_hiss': {
+            // Rising hiss telegraph
+            const nb = audioCtx.sampleRate * 0.8;
+            const nbuf = audioCtx.createBuffer(1, nb, audioCtx.sampleRate);
+            const nd = nbuf.getChannelData(0);
+            for (let i = 0; i < nb; i++) nd[i] = (Math.random()*2-1) * 0.5;
+            const ns = audioCtx.createBufferSource(); ns.buffer = nbuf;
+            const ng = audioCtx.createGain();
+            ng.gain.setValueAtTime(0.03, now);
+            ng.gain.linearRampToValueAtTime(0.08, now + 0.7);
+            ng.gain.exponentialRampToValueAtTime(0.001, now + 0.8);
+            const lpf = audioCtx.createBiquadFilter(); lpf.type='lowpass';
+            lpf.frequency.setValueAtTime(200, now);
+            lpf.frequency.exponentialRampToValueAtTime(600, now + 0.8);
+            ns.connect(lpf).connect(ng).connect(audioCtx.destination); ns.start(now);
+            break;
+        }
+        case 'leviathan_impact': {
+            // Heavy wet thud
+            const o = audioCtx.createOscillator(); const g = audioCtx.createGain();
+            o.type = 'sine'; o.frequency.setValueAtTime(80, now);
+            o.frequency.exponentialRampToValueAtTime(30, now + 0.1);
+            g.gain.setValueAtTime(0.15, now);
+            g.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+            o.connect(g).connect(audioCtx.destination);
+            o.start(now); o.stop(now + 0.15);
+            // Wet splash noise
+            const nb2 = audioCtx.sampleRate * 0.08;
+            const nbuf2 = audioCtx.createBuffer(1, nb2, audioCtx.sampleRate);
+            const nd2 = nbuf2.getChannelData(0);
+            for (let i = 0; i < nb2; i++) nd2[i] = (Math.random()*2-1) * (1-i/nb2);
+            const ns2 = audioCtx.createBufferSource(); ns2.buffer = nbuf2;
+            const ng2 = audioCtx.createGain(); ng2.gain.setValueAtTime(0.08, now);
+            const bp = audioCtx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=400;
+            ns2.connect(bp).connect(ng2).connect(audioCtx.destination); ns2.start(now);
+            // Ground crack
+            const nb3 = audioCtx.sampleRate * 0.03;
+            const nbuf3 = audioCtx.createBuffer(1, nb3, audioCtx.sampleRate);
+            const nd3 = nbuf3.getChannelData(0);
+            for (let i = 0; i < nb3; i++) nd3[i] = (Math.random()*2-1) * (1-i/nb3);
+            const ns3 = audioCtx.createBufferSource(); ns3.buffer = nbuf3;
+            const ng3 = audioCtx.createGain(); ng3.gain.setValueAtTime(0.05, now);
+            const hp3 = audioCtx.createBiquadFilter(); hp3.type='highpass'; hp3.frequency.value=1000;
+            ns3.connect(hp3).connect(ng3).connect(audioCtx.destination); ns3.start(now);
+            break;
+        }
+        case 'leviathan_slide': {
+            // Wet sliding sound
+            const nb = audioCtx.sampleRate * 1.5;
+            const nbuf = audioCtx.createBuffer(1, nb, audioCtx.sampleRate);
+            const nd = nbuf.getChannelData(0);
+            for (let i = 0; i < nb; i++) nd[i] = (Math.random()*2-1) * Math.pow(1-i/nb, 0.5) * 0.3;
+            const ns = audioCtx.createBufferSource(); ns.buffer = nbuf;
+            const ng = audioCtx.createGain(); ng.gain.setValueAtTime(0.04, now);
+            ng.gain.exponentialRampToValueAtTime(0.001, now + 1.2);
+            const filt = audioCtx.createBiquadFilter(); filt.type='bandpass'; filt.frequency.value=300;
+            ns.connect(filt).connect(ng).connect(audioCtx.destination); ns.start(now);
+            break;
+        }
+        case 'leviathan_spit': {
+            // Wet gurgling launch
+            for (let i = 0; i < 3; i++) {
+                const o = audioCtx.createOscillator(); const g = audioCtx.createGain();
+                o.type = 'sine'; o.frequency.setValueAtTime(150 + i * 30, now + i * 0.05);
+                g.gain.setValueAtTime(0.06, now + i * 0.05);
+                g.gain.exponentialRampToValueAtTime(0.001, now + i * 0.05 + 0.1);
+                const mod = audioCtx.createOscillator(); const modG = audioCtx.createGain();
+                mod.frequency.value = 20; modG.gain.value = 50;
+                mod.connect(modG).connect(o.frequency);
+                mod.start(now + i * 0.05); mod.stop(now + i * 0.05 + 0.1);
+                o.connect(g).connect(audioCtx.destination);
+                o.start(now + i * 0.05); o.stop(now + i * 0.05 + 0.1);
+            }
+            break;
+        }
+        case 'leviathan_splash': {
+            // Water splash
+            const nb = audioCtx.sampleRate * 0.1;
+            const nbuf = audioCtx.createBuffer(1, nb, audioCtx.sampleRate);
+            const nd = nbuf.getChannelData(0);
+            for (let i = 0; i < nb; i++) nd[i] = (Math.random()*2-1) * (1-i/nb);
+            const ns = audioCtx.createBufferSource(); ns.buffer = nbuf;
+            const ng = audioCtx.createGain(); ng.gain.setValueAtTime(0.06, now);
+            const hp = audioCtx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=800;
+            ns.connect(hp).connect(ng).connect(audioCtx.destination); ns.start(now);
+            break;
+        }
+        case 'leviathan_drain': {
+            // Long descending filtered noise
+            const nb = audioCtx.sampleRate * 2;
+            const nbuf = audioCtx.createBuffer(1, nb, audioCtx.sampleRate);
+            const nd = nbuf.getChannelData(0);
+            for (let i = 0; i < nb; i++) nd[i] = (Math.random()*2-1) * 0.4 * (1-i/nb);
+            const ns = audioCtx.createBufferSource(); ns.buffer = nbuf;
+            const ng = audioCtx.createGain();
+            ng.gain.setValueAtTime(0.08, now);
+            ng.gain.linearRampToValueAtTime(0.02, now + 2);
+            const filt = audioCtx.createBiquadFilter(); filt.type='lowpass';
+            filt.frequency.setValueAtTime(400, now);
+            filt.frequency.exponentialRampToValueAtTime(100, now + 2);
+            // LFO modulation for gurgle
+            const lfo = audioCtx.createOscillator(); const lfoG = audioCtx.createGain();
+            lfo.frequency.value = 4; lfoG.gain.value = 100;
+            lfo.connect(lfoG).connect(filt.frequency);
+            lfo.start(now); lfo.stop(now + 2);
+            ns.connect(filt).connect(ng).connect(audioCtx.destination); ns.start(now);
+            break;
+        }
+        case 'leviathan_victory': {
+            // Silence then ascending chime with shimmer
+            [400, 500, 600, 800].forEach((f, i) => {
+                const o = audioCtx.createOscillator(); const g = audioCtx.createGain();
+                o.type = 'sine'; o.frequency.setValueAtTime(f, now + 0.5 + i * 0.12);
+                g.gain.setValueAtTime(0.07, now + 0.5 + i * 0.12);
+                g.gain.exponentialRampToValueAtTime(0.001, now + 0.5 + i * 0.12 + 0.4);
+                // Echo/delay effect
+                const delay = audioCtx.createDelay(0.3);
+                delay.delayTime.value = 0.15;
+                const dg = audioCtx.createGain(); dg.gain.value = 0.3;
+                o.connect(g).connect(audioCtx.destination);
+                o.connect(g).connect(delay).connect(dg).connect(audioCtx.destination);
+                o.start(now + 0.5 + i * 0.12); o.stop(now + 0.5 + i * 0.12 + 0.5);
+                // Shimmer noise
+                const nb = audioCtx.sampleRate * 0.02;
+                const nbuf = audioCtx.createBuffer(1, nb, audioCtx.sampleRate);
+                const nd = nbuf.getChannelData(0);
+                for (let j = 0; j < nb; j++) nd[j] = (Math.random()*2-1) * (1-j/nb) * 0.1;
+                const ns = audioCtx.createBufferSource(); ns.buffer = nbuf;
+                const nfilt = audioCtx.createBiquadFilter(); nfilt.type='highpass'; nfilt.frequency.value=5000;
+                const ng = audioCtx.createGain(); ng.gain.setValueAtTime(0.02, now + 0.5 + i*0.12);
+                ns.connect(nfilt).connect(ng).connect(audioCtx.destination); ns.start(now + 0.5 + i*0.12);
+            });
+            break;
+        }
     }
 }
 
@@ -7058,12 +8274,32 @@ function gameLoop(timestamp) {
         updateDagger(dt);
         updateItemEffectsOnEnemies(dt);
         updateShieldAmulet(dt);
-        // Boss activation for room 10
+        // Boss activation for room 10 and 30
         if ((game.currentRoom === 10 || game.currentRoom === 30) && !boss.activated) {
             const cx = player.x - PLAY_OFFSET_X, cy = player.y - PLAY_OFFSET_Y;
             if (cy < PLAY_H * 0.6 && cx > PLAY_W * 0.3 && cx < PLAY_W * 0.7) {
                 activateBoss();
             }
+        }
+        // Leviathan boss activation for room 20
+        if (game.currentRoom === 20 && !leviathan.activated) {
+            const cy = player.y - PLAY_OFFSET_Y;
+            if (cy < PLAY_H * 0.65) {
+                activateLeviathan();
+            }
+        }
+        // Leviathan update
+        if (game.currentRoom === 20) {
+            updateLeviathan(dt);
+            checkLeviathanHit();
+        }
+        // Mimic room logic
+        if (game.currentRoom === 17 && currentRoomData._mimicRoom) {
+            updateMimicRoom(dt);
+        }
+        // Healing spring
+        if (game.currentRoom === 19 && currentRoomData._healSpring) {
+            updateHealSpring(dt);
         }
     }
 
@@ -7174,6 +8410,8 @@ function render(time) {
 
     // Draw boss
     drawBoss(bctx, time);
+    // Draw Leviathan boss
+    if (game.currentRoom === 20) drawLeviathan(bctx, time);
 
     // Draw hero
     drawHero(bctx);
